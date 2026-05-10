@@ -1,0 +1,8 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Custom SMM Panel Styles */
+body {
+    @apply antialiased;
+}

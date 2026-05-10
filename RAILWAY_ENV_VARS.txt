@@ -1,0 +1,89 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# RAILWAY ENVIRONMENT VARIABLES
+# ══════════════════════════════════════════════════════════════════════════════
+# Add ALL of these in Railway → your service → Variables tab
+# Use ${{MySQL.MYSQLHOST}} syntax to reference linked service variables
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── App ───────────────────────────────────────────────────────────────────────
+APP_NAME=SMM Elite
+APP_ENV=production
+APP_DEBUG=false
+APP_KEY=                            # php artisan key:generate --show
+APP_URL=https://yourapp.up.railway.app
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+LOG_CHANNEL=stack
+LOG_LEVEL=error
+
+# ── Database (link PostgreSQL plugin first) ──────────────────────────────────
+DB_CONNECTION=pgsql
+DATABASE_URL=${{Postgres.DATABASE_URL}}
+DB_HOST=${{Postgres.PGHOST}}
+DB_PORT=${{Postgres.PGPORT}}
+DB_DATABASE=${{Postgres.PGDATABASE}}
+DB_USERNAME=${{Postgres.PGUSER}}
+DB_PASSWORD=${{Postgres.PGPASSWORD}}
+DB_SSLMODE=require
+
+# ── Redis (link Redis plugin first) ───────────────────────────────────────────
+REDIS_URL=${{Redis.REDIS_URL}}
+REDIS_HOST=${{Redis.REDISHOST}}
+REDIS_PORT=${{Redis.REDISPORT}}
+REDIS_PASSWORD=${{Redis.REDISPASSWORD}}
+
+# ── Drivers ───────────────────────────────────────────────────────────────────
+CACHE_DRIVER=redis
+QUEUE_CONNECTION=redis
+SESSION_DRIVER=redis
+SESSION_LIFETIME=120
+SESSION_SECURE_COOKIE=true
+BROADCAST_DRIVER=log
+FILESYSTEM_DISK=public
+
+# ── Mail ──────────────────────────────────────────────────────────────────────
+MAIL_MAILER=smtp
+MAIL_HOST=smtp-relay.brevo.com
+MAIL_PORT=587
+MAIL_USERNAME=your_brevo_email
+MAIL_PASSWORD=your_brevo_smtp_key
+MAIL_ENCRYPTION=tls
+MAIL_FROM_ADDRESS=noreply@yourdomain.com
+MAIL_FROM_NAME=SMM Elite
+
+# ── Stripe ────────────────────────────────────────────────────────────────────
+STRIPE_KEY=pk_live_xxxx
+STRIPE_SECRET=sk_live_xxxx
+STRIPE_WEBHOOK_SECRET=whsec_xxxx
+
+# ── PayPal ────────────────────────────────────────────────────────────────────
+PAYPAL_CLIENT_ID=
+PAYPAL_SECRET=
+PAYPAL_MODE=live
+PAYPAL_WEBHOOK_ID=
+
+# ── Exchange Rate ─────────────────────────────────────────────────────────────
+EXCHANGE_RATE_API_KEY=
+EXCHANGE_RATE_CACHE_TTL=3600
+
+# ── Sentry ────────────────────────────────────────────────────────────────────
+SENTRY_LARAVEL_DSN=
+
+# ══════════════════════════════════════════════════════════════════════════════
+# RAILWAY SERVICE ARCHITECTURE
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Service 1 — Web App (same GitHub repo, nixpacks.toml handles build)
+#   Start: php -S 0.0.0.0:$PORT -t public
+#   (nixpacks.toml start cmd runs migrations first then this)
+#
+# Service 2 — Queue Worker (same GitHub repo)
+#   Start: php artisan queue:work --tries=3 --timeout=90 --queue=payments,default,emails,notifications
+#   Give it all the same env vars as Service 1
+#
+# Service 3 — Scheduler (same GitHub repo)
+#   Start: while true; do php artisan schedule:run; sleep 60; done
+#   Give it all the same env vars as Service 1
+#
+# Service 4 — MySQL plugin
+# Service 5 — Redis plugin

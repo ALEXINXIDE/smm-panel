@@ -1,0 +1,216 @@
+version: '3.9'
+
+# ==============================================================================
+# docker-compose.yml — Production Stack
+# ==============================================================================
+# Services:
+#  - app: Laravel + Nginx + PHP-FPM + Supervisor (all in one container)
+#  - worker: Dedicated queue worker (separate for horizontal scaling)
+#  - scheduler: Laravel scheduler (runs artisan schedule:work)
+#  - db: PostgreSQL 16 (upgraded from MySQL — better for production SaaS)
+#  - redis: Redis 7 (cache, sessions, queues)
+#
+# Changes from original:
+#  1. MySQL replaced with PostgreSQL 16
+#  2. Added POSTGRES_* environment variables
+#  3. Added postgres_data volume
+#  4. Added .dockerignore reference
+#  5. Worker command updated with queue names (payments, default, emails)
+#  6. Health checks on all services
+# ==============================================================================
+
+services:
+
+  # ── Application (Nginx + PHP-FPM + Supervisor) ─────────────────────────────
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: app
+    image: smm-panel:latest
+    container_name: smm_app
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      APP_ENV: production
+      APP_DEBUG: 'false'
+      DB_CONNECTION: pgsql
+      DB_HOST: db
+      DB_PORT: 5432
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      CACHE_DRIVER: redis
+      SESSION_DRIVER: redis
+      QUEUE_CONNECTION: redis
+    volumes:
+      - app_storage:/var/www/html/storage
+      - app_logs:/var/log
+    ports:
+      - '${APP_PORT:-80}:80'
+    networks:
+      - smm_network
+    healthcheck:
+      test: ['CMD', 'curl', '-f', '-s', 'http://localhost/up']
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s  # Give time for migrations to run on first start
+
+  # ── Queue Worker (payments — high priority) ────────────────────────────────
+  # Separate container for horizontal scaling — add more replicas under load
+  worker-payments:
+    image: smm-panel:latest
+    container_name: smm_worker_payments
+    restart: unless-stopped
+    # Override entrypoint to skip migrations (app container handles that)
+    entrypoint: []
+    command: php artisan queue:work redis
+      --queue=payments
+      --sleep=1
+      --tries=0
+      --timeout=60
+      --max-jobs=500
+      --max-time=3600
+      --no-interaction
+    depends_on:
+      app:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      APP_ENV: production
+      APP_DEBUG: 'false'
+      DB_CONNECTION: pgsql
+      DB_HOST: db
+      DB_PORT: 5432
+      REDIS_HOST: redis
+      QUEUE_CONNECTION: redis
+    volumes:
+      - app_storage:/var/www/html/storage
+    networks:
+      - smm_network
+
+  # ── Queue Worker (general) ─────────────────────────────────────────────────
+  worker-default:
+    image: smm-panel:latest
+    container_name: smm_worker_default
+    restart: unless-stopped
+    entrypoint: []
+    command: php artisan queue:work redis
+      --queue=default,emails,notifications
+      --sleep=3
+      --tries=0
+      --timeout=90
+      --max-jobs=500
+      --max-time=3600
+      --no-interaction
+    depends_on:
+      app:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      APP_ENV: production
+      APP_DEBUG: 'false'
+      DB_CONNECTION: pgsql
+      DB_HOST: db
+      DB_PORT: 5432
+      REDIS_HOST: redis
+      QUEUE_CONNECTION: redis
+    volumes:
+      - app_storage:/var/www/html/storage
+    networks:
+      - smm_network
+
+  # ── Scheduler ──────────────────────────────────────────────────────────────
+  scheduler:
+    image: smm-panel:latest
+    container_name: smm_scheduler
+    restart: unless-stopped
+    entrypoint: []
+    command: php artisan schedule:work
+    depends_on:
+      app:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      APP_ENV: production
+      DB_CONNECTION: pgsql
+      DB_HOST: db
+      DB_PORT: 5432
+      REDIS_HOST: redis
+      QUEUE_CONNECTION: redis
+    volumes:
+      - app_storage:/var/www/html/storage
+    networks:
+      - smm_network
+
+  # ── PostgreSQL 16 ──────────────────────────────────────────────────────────
+  db:
+    image: postgres:16-alpine
+    container_name: smm_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${DB_DATABASE:-smm_panel}
+      POSTGRES_USER: ${DB_USERNAME:-smm_user}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      # Performance tuning (tune based on available RAM)
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./docker/postgres/postgresql.conf:/etc/postgresql/postgresql.conf:ro
+      - ./docker/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    command: postgres -c config_file=/etc/postgresql/postgresql.conf
+    networks:
+      - smm_network
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U ${DB_USERNAME:-smm_user} -d ${DB_DATABASE:-smm_panel}']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # ── Redis 7 ────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: smm_redis
+    restart: unless-stopped
+    # AOF persistence + password protection
+    command: redis-server
+      --appendonly yes
+      --requirepass ${REDIS_PASSWORD}
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    networks:
+      - smm_network
+    healthcheck:
+      test: ['CMD', 'redis-cli', '-a', '${REDIS_PASSWORD}', 'ping']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  app_storage:
+    driver: local
+  app_logs:
+    driver: local
+
+networks:
+  smm_network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16

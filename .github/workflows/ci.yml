@@ -1,0 +1,285 @@
+name: CI/CD Pipeline
+
+# ==============================================================================
+# .github/workflows/ci.yml — Enterprise CI/CD for SMM Panel
+# ==============================================================================
+# Pipeline stages:
+#  1. lint:      PHP syntax check, code style (Pint), static analysis (PHPStan)
+#  2. test:      PHPUnit tests against PostgreSQL (matching production)
+#  3. security:  Composer audit for known vulnerabilities
+#  4. build:     Docker image build + vulnerability scan
+#  5. deploy:    Auto-deploy to Railway/Render on main branch push
+#
+# Secrets required (set in GitHub → Settings → Secrets):
+#  - RAILWAY_TOKEN (for Railway deployment)
+#  - DOCKER_HUB_USERNAME + DOCKER_HUB_TOKEN (for image registry)
+#  - SENTRY_AUTH_TOKEN (for Sentry release tracking)
+# ==============================================================================
+
+on:
+  push:
+    branches: [main, staging]
+  pull_request:
+    branches: [main, staging]
+
+env:
+  PHP_VERSION: '8.2'
+  NODE_VERSION: '20'
+  DOCKER_IMAGE: ${{ secrets.DOCKER_HUB_USERNAME }}/smm-panel
+
+jobs:
+
+  # ── Stage 1: Code Quality ────────────────────────────────────────────────
+  lint:
+    name: Lint & Static Analysis
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ env.PHP_VERSION }}
+          extensions: pdo_pgsql, redis, mbstring, zip, bcmath
+          coverage: none
+
+      - name: Cache Composer packages
+        uses: actions/cache@v4
+        with:
+          path: vendor
+          key: composer-${{ hashFiles('composer.lock') }}
+          restore-keys: composer-
+
+      - name: Install PHP dependencies
+        run: composer install --no-interaction --prefer-dist --no-scripts
+
+      - name: Check PHP syntax
+        run: find app database config routes -name "*.php" -exec php -l {} \;
+
+      - name: Run Laravel Pint (code style)
+        run: vendor/bin/pint --test
+        continue-on-error: true  # Warn but don't fail CI on style issues
+
+      # PHPStan — static analysis catches type errors before runtime
+      - name: Run PHPStan
+        run: |
+          if [ -f phpstan.neon ]; then
+            vendor/bin/phpstan analyse --no-progress --memory-limit=256M
+          else
+            echo "phpstan.neon not found — skipping static analysis"
+          fi
+
+  # ── Stage 2: Security Audit ───────────────────────────────────────────────
+  security:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ env.PHP_VERSION }}
+          coverage: none
+
+      - name: Install dependencies
+        run: composer install --no-interaction --prefer-dist --no-scripts
+
+      # Checks all composer packages against the PHP Security Advisory Database
+      - name: Audit Composer dependencies
+        run: composer audit --no-dev
+
+      # Check .env.example doesn't contain real secrets
+      - name: Check for leaked secrets in .env.example
+        run: |
+          if grep -E "(sk_live_|pk_live_|whsec_|AAAA|AIza)" .env.example 2>/dev/null; then
+            echo "ERROR: Real API key detected in .env.example!"
+            exit 1
+          fi
+
+  # ── Stage 3: Tests ────────────────────────────────────────────────────────
+  test:
+    name: PHPUnit Tests
+    runs-on: ubuntu-latest
+    needs: [lint]
+
+    services:
+      # Match production DB exactly — tests pass on PG = confidence in PG production
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: smm_test
+          POSTGRES_USER: smm_test
+          POSTGRES_PASSWORD: secret
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+      redis:
+        image: redis:7-alpine
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ env.PHP_VERSION }}
+          extensions: pdo_pgsql, redis, mbstring, zip, bcmath
+          coverage: xdebug
+
+      - name: Cache Composer packages
+        uses: actions/cache@v4
+        with:
+          path: vendor
+          key: composer-${{ hashFiles('composer.lock') }}
+
+      - name: Install dependencies
+        run: composer install --no-interaction --prefer-dist
+
+      - name: Setup test environment
+        run: |
+          cp .env.example .env.testing
+          php artisan key:generate --env=testing
+        env:
+          DB_CONNECTION: pgsql
+          DB_HOST: 127.0.0.1
+          DB_PORT: 5432
+          DB_DATABASE: smm_test
+          DB_USERNAME: smm_test
+          DB_PASSWORD: secret
+          REDIS_HOST: 127.0.0.1
+          CACHE_DRIVER: array
+          SESSION_DRIVER: array
+          QUEUE_CONNECTION: sync
+
+      - name: Run migrations for testing
+        run: php artisan migrate --env=testing --force
+        env:
+          DB_CONNECTION: pgsql
+          DB_HOST: 127.0.0.1
+          DB_DATABASE: smm_test
+          DB_USERNAME: smm_test
+          DB_PASSWORD: secret
+
+      - name: Run PHPUnit tests
+        run: vendor/bin/phpunit --coverage-text --coverage-clover coverage.xml
+        env:
+          DB_CONNECTION: pgsql
+          DB_HOST: 127.0.0.1
+          DB_DATABASE: smm_test
+          DB_USERNAME: smm_test
+          DB_PASSWORD: secret
+          REDIS_HOST: 127.0.0.1
+          QUEUE_CONNECTION: sync
+
+      # Upload coverage report for visibility
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          file: coverage.xml
+        continue-on-error: true
+
+  # ── Stage 4: Docker Build ─────────────────────────────────────────────────
+  docker:
+    name: Docker Build & Scan
+    runs-on: ubuntu-latest
+    needs: [test, security]
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/staging'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_HUB_USERNAME }}
+          password: ${{ secrets.DOCKER_HUB_TOKEN }}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.DOCKER_IMAGE }}
+          tags: |
+            type=sha,prefix=sha-
+            type=ref,event=branch
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Scan image for OS + package vulnerabilities
+      - name: Scan Docker image with Trivy
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.DOCKER_IMAGE }}:sha-${{ github.sha }}
+          format: 'table'
+          exit-code: '0'  # Don't fail CI on warnings; set to 1 to block on HIGH/CRITICAL
+          severity: 'HIGH,CRITICAL'
+
+  # ── Stage 5: Deploy (main branch only) ───────────────────────────────────
+  deploy:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: [docker]
+    if: github.ref == 'refs/heads/main'
+    environment:
+      name: production
+      url: ${{ vars.APP_URL }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ── Railway Deployment ───────────────────────────────────────────────
+      # Set DEPLOY_TARGET=railway in GitHub vars to use Railway
+      - name: Deploy to Railway
+        if: vars.DEPLOY_TARGET == 'railway'
+        run: |
+          curl -fsSL https://railway.app/install.sh | sh
+          railway up --detach
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+
+      # ── Coolify Deployment ───────────────────────────────────────────────
+      # Set DEPLOY_TARGET=coolify and configure COOLIFY_WEBHOOK_URL
+      - name: Deploy to Coolify
+        if: vars.DEPLOY_TARGET == 'coolify'
+        run: |
+          curl -X POST \
+            -H "Authorization: Bearer ${{ secrets.COOLIFY_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            "${{ secrets.COOLIFY_WEBHOOK_URL }}"
+
+      # ── Sentry Release Tracking ──────────────────────────────────────────
+      - name: Notify Sentry of new release
+        if: vars.SENTRY_ORG != ''
+        uses: getsentry/action-release@v1
+        env:
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+          SENTRY_ORG: ${{ vars.SENTRY_ORG }}
+          SENTRY_PROJECT: ${{ vars.SENTRY_PROJECT }}
+        with:
+          environment: production
+          version: ${{ github.sha }}
