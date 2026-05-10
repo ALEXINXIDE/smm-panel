@@ -12,7 +12,7 @@ warn()    { echo -e "${YELLOW}[WARN]${NC} $1"; }
 error()   { echo -e "${RED}[ERR]${NC}  $1"; exit 1; }
 
 # ── Config — edit these before running ──────────────────────
-GITHUB_REPO="https://github.com/Khanxd9246/smm-panel.git"
+GITHUB_REPO="https://github.com/ALEXINXIDE/smm-panel.git"
 APP_DIR="/var/www/smm-panel"
 DB_NAME="smm_panel"
 DB_USER="smm_user"
