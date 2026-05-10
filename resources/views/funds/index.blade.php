@@ -90,7 +90,7 @@
                 </div>
             </div>
             @if($account->notes)
-            <p class="text-xs text-outline border-t border-outline-variant/20 pt-2 mt-1">{{ Str::limit($account->notes, 80) }}</p>
+            <p class="text-xs text-outline border-t border-outline-variant/20 pt-2 mt-1">{{ $account->notes ? mb_strimwidth($account->notes, 0, 80, '…') : '' }}</p>
             @endif
         </button>
         @endforeach
@@ -247,3 +247,4 @@ selectAccount({{ old('fund_account_id') }});
 @endif
 </script>
 @endsection
+
