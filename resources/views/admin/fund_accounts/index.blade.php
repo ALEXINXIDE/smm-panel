@@ -58,7 +58,7 @@
                             </td>
 
                             <td class="px-6 py-4 text-on-surface-variant text-sm">
-                                {{ Str::limit($account->notes, 60) ?: '—' }}
+                                {{ $account->notes ? mb_strimwidth($account->notes, 0, 60, '…') : '—' }}
                             </td>
 
                             {{-- Toggle switch --}}
@@ -152,3 +152,4 @@ function toggleAccount(id, btn) {
 }
 </script>
 @endsection
+
